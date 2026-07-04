@@ -1,6 +1,6 @@
 {
   "name": "@zincapp/znvault-migrate",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Shared MySQL schema-migration library for ZnVault deployer tooling",
   "type": "module",
   "main": "dist/index.js",
