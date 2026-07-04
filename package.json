@@ -1,0 +1,65 @@
+{
+  "name": "@zincapp/znvault-migrate",
+  "version": "1.0.0",
+  "description": "Shared MySQL schema-migration library for ZnVault deployer tooling",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "build:prod": "tsc --sourceMap false",
+    "dev": "tsc --watch",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "lint": "ESLINT_USE_FLAT_CONFIG=false eslint 'src/**/*.ts' 'test/**/*.ts'",
+    "lint:fix": "ESLINT_USE_FLAT_CONFIG=false eslint 'src/**/*.ts' 'test/**/*.ts' --fix",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build:prod"
+  },
+  "keywords": [
+    "znvault",
+    "mysql",
+    "migration",
+    "schema",
+    "database"
+  ],
+  "author": "ZincApp",
+  "license": "MIT",
+  "homepage": "https://github.com/vidaldiego/znvault-migrate#readme",
+  "bugs": {
+    "url": "https://github.com/vidaldiego/znvault-migrate/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vidaldiego/znvault-migrate.git"
+  },
+  "dependencies": {
+    "mysql2": "^3.16.1"
+  },
+  "devDependencies": {
+    "@types/node": "^25.0.10",
+    "@typescript-eslint/eslint-plugin": "^8.53.1",
+    "@typescript-eslint/parser": "^8.53.1",
+    "@vitest/coverage-v8": "^4.0.17",
+    "eslint": "^9.39.2",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.17"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
