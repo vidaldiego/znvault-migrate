@@ -56,7 +56,13 @@ let dropShouldThrow = false;
  * always reports the lock held.
  */
 function makeFakeAdapter(
-  opts: { throwOnPending?: boolean; isUsedLockRejectAfter?: number } = {},
+  opts: {
+    throwOnPending?: boolean;
+    isUsedLockRejectAfter?: number;
+    throwOnRepoAll?: boolean;
+    throwOnRollback?: boolean;
+    throwOnScaffolding?: boolean;
+  } = {},
 ): EngineAdapter {
   let lockHeldCallCount = 0;
   const rows: MigrationRow[] = [];
@@ -64,6 +70,10 @@ function makeFakeAdapter(
   const repo: SchemaMigrationsRepo = {
     async ensureTable(): Promise<void> {},
     async all(): Promise<MigrationRow[]> {
+      if (opts.throwOnRepoAll && trace.includes('scaffold-apply')) {
+        trace.push('repo-all-failed');
+        throw new Error('boom: repo all failed after scaffolding');
+      }
       return rows;
     },
     async claim(version: string, checksum: string, appliedBy: string): Promise<void> {
@@ -77,6 +87,9 @@ function makeFakeAdapter(
     async seedBaseline(version: string, checksum: string, appliedBy: string): Promise<void> {
       rows.push({ version, checksum, checksumAlgo: 'sha256-lf-v1', success: true, baselined: true });
       void appliedBy;
+    },
+    async repairFailedChecksum(): Promise<void> {
+      throw new Error('no checksum repair expected in scaffolding tests');
     },
   };
 
@@ -106,16 +119,14 @@ function makeFakeAdapter(
         if (opts.throwOnPending) throw new Error('boom: pending migration failed');
       }
     },
-    async reconcile(
-      _conn: Conn,
-      version: string,
-      fileSql: string,
-      repoArg: SchemaMigrationsRepo,
-    ): Promise<void> {
+    async reconcile(_conn: Conn, _version: string, fileSql: string): Promise<void> {
       if (/'reconcile-body'/.test(fileSql)) {
         trace.push('reconcile');
       }
-      await repoArg.markSuccess(version, 0);
+    },
+    async rollbackTransaction(): Promise<void> {
+      trace.push('rollback');
+      if (opts.throwOnRollback) throw new Error('boom: rollback failed');
     },
     schemaMigrationsRepo(): SchemaMigrationsRepo {
       return repo;
@@ -128,6 +139,7 @@ function makeFakeAdapter(
     },
     async applyScaffolding(): Promise<void> {
       trace.push('scaffold-apply');
+      if (opts.throwOnScaffolding) throw new Error('boom: scaffolding partially applied');
     },
   };
 
@@ -204,8 +216,51 @@ describe('MigrationRunner scaffolding bracket', () => {
 
     // scaffold-apply happened, pending was attempted (and threw), and — critically —
     // scaffold-drop STILL ran despite the thrown error.
-    expect(trace).toEqual(['scaffold-apply', 'pending', 'scaffold-drop']);
+    expect(trace).toEqual(['scaffold-apply', 'pending', 'rollback', 'scaffold-drop']);
     expect(dropCalls).toEqual(['v_migrate_abc']);
+  });
+
+  it('drops partially-created scaffolding when failure happens before planning', async () => {
+    const adapter = makeFakeAdapter({ throwOnRepoAll: true });
+    const runner = new MigrationRunner(adapter, fakeConn, dir, 'test-runner', [], {
+      filename: 'migration_utils.sql',
+      leaseUser: 'v_migrate_abc',
+    });
+
+    await expect(runner.run()).rejects.toThrow('repo all failed after scaffolding');
+
+    expect(trace).toEqual(['scaffold-apply', 'repo-all-failed', 'rollback', 'scaffold-drop']);
+    expect(dropCalls).toEqual(['v_migrate_abc']);
+  });
+
+  it('drops partially-created scaffolding when applyScaffolding itself throws', async () => {
+    const adapter = makeFakeAdapter({ throwOnScaffolding: true });
+    const runner = new MigrationRunner(adapter, fakeConn, dir, 'test-runner', [], {
+      filename: 'migration_utils.sql',
+      leaseUser: 'v_migrate_abc',
+    });
+
+    await expect(runner.run()).rejects.toThrow('scaffolding partially applied');
+
+    expect(trace).toEqual(['scaffold-apply', 'rollback', 'scaffold-drop']);
+    expect(dropCalls).toEqual(['v_migrate_abc']);
+  });
+
+  it('preserves the primary error and skips cleanup DDL when rollback cannot be confirmed', async () => {
+    writeFileSync(join(dir, '2026-07-02_001_probe.sql'), "SELECT 'pending-body';\n");
+    const adapter = makeFakeAdapter({ throwOnPending: true, throwOnRollback: true });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const runner = new MigrationRunner(adapter, fakeConn, dir, 'test-runner', [], {
+      filename: 'migration_utils.sql',
+      leaseUser: 'v_migrate_abc',
+    });
+
+    await expect(runner.run()).rejects.toThrow('boom: pending migration failed');
+
+    expect(trace).toEqual(['scaffold-apply', 'pending', 'rollback']);
+    expect(trace).not.toContain('scaffold-drop');
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('rollback failed before scaffolding cleanup'));
+    warnSpy.mockRestore();
   });
 
   it('skips the drop (no masking) when the lock-held check rejects during cleanup, on a SUCCESSFUL phase', async () => {
@@ -260,7 +315,7 @@ describe('MigrationRunner scaffolding bracket', () => {
     // replace it with its own error.
     await expect(runner.run()).rejects.toThrow(/boom: pending migration failed/);
 
-    expect(trace).toEqual(['scaffold-apply', 'pending']);
+    expect(trace).toEqual(['scaffold-apply', 'pending', 'rollback']);
     expect(trace).not.toContain('scaffold-drop');
     expect(dropCalls).toEqual([]);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('lock.isHeld() failed'));
@@ -306,7 +361,7 @@ describe('MigrationRunner scaffolding bracket', () => {
     // cleanup's own failure must not replace or mask it.
     await expect(runner.run()).rejects.toThrow(/boom: pending migration failed/);
 
-    expect(trace).toEqual(['scaffold-apply', 'pending', 'scaffold-drop']);
+    expect(trace).toEqual(['scaffold-apply', 'pending', 'rollback', 'scaffold-drop']);
     expect(dropCalls).toEqual(['v_migrate_abc']);
     expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('dropDefinerObjects'));
 

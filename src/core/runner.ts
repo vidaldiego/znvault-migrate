@@ -6,6 +6,10 @@ import { readBaselineMarker } from './baseline-marker.js';
 import { canonicalChecksumFile } from './checksum.js';
 import { plan } from './planner.js';
 import type { RunResult } from './types.js';
+import {
+  APPROVED_FAILED_MIGRATION_CHECKSUM_REPAIRS,
+  type FailedMigrationChecksumRepair,
+} from './failed-checksum-repair.js';
 
 export type { RunResult };
 
@@ -15,7 +19,8 @@ export type { RunResult };
  * Ports MigrationRunner.kt + MigrateMain.kt orchestration EXACTLY:
  *  - status(): read-only — ensureTable + plan; preflight(version-check only).
  *  - run(): write path — preflight(requireWritePrimary=true) → ensureTable (before lock,
- *    Kotlin parity) → acquire → seedIfVirgin → plan → reconcile → pending → release.
+ *    Kotlin parity) → acquire → exact failed-checksum repair → seedIfVirgin → plan →
+ *    reconcile → pending → release.
  *
  * `zn_*` helper procedures (0000_ files) are NOT created by this engine — see the
  * doc comment on run() for details.
@@ -59,6 +64,7 @@ export class MigrationRunner {
     private readonly appliedBy: string,
     private readonly integrityDirs: string[] = [],
     private readonly scaffolding?: { filename: string; leaseUser: string },
+    private readonly checksumRepairs: readonly FailedMigrationChecksumRepair[] = APPROVED_FAILED_MIGRATION_CHECKSUM_REPAIRS,
   ) {
     this.repo = adapter.schemaMigrationsRepo(conn);
   }
@@ -89,7 +95,14 @@ export class MigrationRunner {
     await this.adapter.preflight(this.conn, false); // version-check only; skip read-only check
     await this.repo.ensureTable();
     const phaseFiles = discover(this.migrationsDir);
-    const p = plan(phaseFiles, await this.repo.all(), canonicalChecksumFile, this.allTrackedFiles(phaseFiles));
+    const trackedFiles = this.allTrackedFiles(phaseFiles);
+    const filesByVersion = new Map(trackedFiles.map((file) => [file.version, file]));
+    const previewRows = (await this.repo.all()).map((row) => {
+      const file = filesByVersion.get(row.version);
+      const repair = file ? this.approvedRepairFor(row, file.path) : undefined;
+      return repair ? { ...row, checksum: repair.newChecksum } : row;
+    });
+    const p = plan(phaseFiles, previewRows, canonicalChecksumFile, trackedFiles);
     return { applied: p.applied.length, reconcile: p.reconcile.length, pending: p.pending.length };
   }
 
@@ -102,28 +115,25 @@ export class MigrationRunner {
    *  3. acquire(db) — GET_LOCK.
    *  3a. scaffolding (if configured) — apply THIS phase's helper objects (migration_utils.sql
    *      or equivalent) before any seeding/reconcile/pending work touches the DB.
-   *  4. seedBaselineIfVirgin — seed baselined rows when schema_migrations is empty.
-   *  5. plan() — classify remaining files.
-   *  6. reconcile — asserts-first; re-run body only when unmet or no asserts.
-   *  7. pending — claim(success=0) → exec → markSuccess(success=1).
-   *  7a. finally (nested, scoped to 6+7): scaffolding cleanup — if configured and the
+   *  4. repairFailedChecksums — exact allowlist + audited compare-and-swap for
+   *     failed, non-baselined rows only (including sibling-phase rows).
+   *  5. seedBaselineIfVirgin — seed baselined rows when schema_migrations is empty.
+   *  6. plan() — classify remaining files.
+   *  7. reconcile — marked postconditions first; legacy/unmet files re-run fully.
+   *  8. pending — claim(success=0) → exec → markSuccess(success=1).
+   *  8a. finally (nested, scoped to 7+8): scaffolding cleanup — if configured and the
    *      lock is still held, drop every object the lease user defined
-   *      (dropDefinerObjects), unconditionally — runs whether 6/7 succeeded or threw.
+   *      (dropDefinerObjects), unconditionally — runs whether 7/8 succeeded or threw.
    *      A cleanup failure is logged, never rethrown (must not mask a primary error).
    *      The lock-held check itself (lockHeld()) is also non-throwing — a dead
    *      connection can make the underlying IS_USED_LOCK query reject rather than
    *      resolve false, and this guard must not mask a primary error either.
-   *  8. finally: release lock; if release was not clean and no primary error, throw tripwire.
+   *  9. finally: release lock; if release was not clean and no primary error, throw tripwire.
    *
-   * The `zn_*` helper procedures (0000_ files) are NO LONGER created here. They are
-   * now provisioned ahead of the migration phase by vault's routines-apply step,
-   * owned by a persistent routines DB account — see the vault-side dynsec-routines-
-   * provisioning feature (docs/superpowers/specs/2026-07-01-dynsec-routines-
-   * provisioning-design.md). Root cause: DROP+CREATE'ing them here made the
-   * ephemeral migrate user their DEFINER, and MySQL 8.4 refuses `DROP USER` for an
-   * account referenced as a stored-routine DEFINER (ER 4006) — which broke lease
-   * revocation on every migration run. Migrations now only `CALL zn_*`; they never
-   * (re)create the procedures themselves.
+   * Discovered `0000_` files remain inert. Helper procedures are supplied explicitly
+   * through the phase's scaffolding config (and cleaned up below), or provisioned by
+   * Vault before the phase. Migrations only `CALL zn_*`; they do not implicitly create
+   * helpers merely because a `0000_` file was discovered.
    */
   async run(): Promise<RunResult> {
     await this.adapter.preflight(this.conn, true); // refuse read-only replica
@@ -136,7 +146,12 @@ export class MigrationRunner {
     await this.adapter.acquireLock(this.conn);
     let primary: unknown = null;
     try {
-      const files = discover(this.migrationsDir);
+      let phaseFailed = false;
+      let rollbackConfirmed = false;
+      let scaffoldingStarted = false;
+      try {
+        const files = discover(this.migrationsDir);
+        const trackedFiles = this.allTrackedFiles(files);
 
       // NOTE: 0000_ helper files are discovered above (discover() does not filter
       // them out) but are intentionally never applied here — plan() excludes them
@@ -147,29 +162,35 @@ export class MigrationRunner {
       // Step 3a: Scaffolding — create THIS phase's migration-helper objects (dropped
       // after reconcile+pending, unconditionally — see the finally block below).
       // Applied before any seeding/reconcile/pending work so bodies can CALL them.
-      if (this.scaffolding && this.adapter.applyScaffolding) {
-        const scaffoldPath = isAbsolute(this.scaffolding.filename)
-          ? this.scaffolding.filename
-          : join(this.migrationsDir, this.scaffolding.filename);
-        await this.adapter.applyScaffolding(this.conn, scaffoldPath);
-      }
+        if (this.scaffolding && this.adapter.applyScaffolding) {
+          const scaffoldPath = isAbsolute(this.scaffolding.filename)
+            ? this.scaffolding.filename
+            : join(this.migrationsDir, this.scaffolding.filename);
+          scaffoldingStarted = true;
+          await this.adapter.applyScaffolding(this.conn, scaffoldPath);
+        }
+
+        await this.repairFailedChecksums(trackedFiles);
 
       // Step 4: Seed baseline rows for a virgin DB (schema_migrations is empty).
-      const seeded = await this.seedBaselineIfVirgin(files);
+        const seeded = await this.seedBaselineIfVirgin(files);
 
       // Step 5: Plan. Integrity lookup spans this dir ∪ the sibling phase dir(s)
       // (they share one schema_migrations table); classification stays scoped to
       // `files` (this phase only ever applies its own directory).
-      const p = plan(files, await this.repo.all(), canonicalChecksumFile, this.allTrackedFiles(files));
+        const p = plan(files, await this.repo.all(), canonicalChecksumFile, trackedFiles);
 
-      let reconciled = 0;
-      let applied = 0;
-      try {
+        let reconciled = 0;
+        let applied = 0;
         // Step 6: Reconcile — asserts-first; re-run body only when asserts are absent
         // or one failed (indicating the migration was only partially applied).
         for (const f of p.reconcile) {
           await this.requireLockHeld();
-          await this.reconcile(f.path);
+          const markedByAdapter = await this.reconcile(f.path);
+          if (!markedByAdapter) {
+            await this.requireLockHeld();
+            await this.repo.markSuccess(f.version, 0);
+          }
           reconciled++;
         }
 
@@ -185,13 +206,36 @@ export class MigrationRunner {
           await this.repo.markSuccess(f.version, Date.now() - start);
           applied++;
         }
+        return { seeded, reconciled, applied, pendingRemaining: 0 };
+      } catch (e) {
+        phaseFailed = true;
+        if (this.adapter.rollbackTransaction) {
+          try {
+            await this.adapter.rollbackTransaction(this.conn);
+            rollbackConfirmed = true;
+          } catch (rollbackError) {
+            console.warn(
+              `rollback failed before scaffolding cleanup; cleanup will be skipped: ${
+                rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+              }`,
+            );
+          }
+        } else {
+          console.warn('adapter cannot confirm rollback; scaffolding cleanup will be skipped');
+        }
+        throw e;
       } finally {
         // Step 7a: Scaffolding cleanup — drop every object the lease user defined,
         // so the ephemeral migrate user is never left a DEFINER (ER-4006). Runs
         // whether the reconcile/pending block above succeeded or threw (unconditional),
         // but ONLY when scaffolding is configured AND the lock is still held (a lost
         // lock means another runner may be concurrently active — do not touch the DB).
-        if (this.scaffolding && (await this.lockHeld())) {
+        if (
+          scaffoldingStarted &&
+          this.scaffolding &&
+          (!phaseFailed || rollbackConfirmed) &&
+          (await this.lockHeld())
+        ) {
           try {
             await this.adapter.dropOwnedObjects(this.conn, this.scaffolding.leaseUser);
           } catch (cleanupErr) {
@@ -205,9 +249,7 @@ export class MigrationRunner {
             );
           }
         }
-      }
-
-      return { seeded, reconciled, applied, pendingRemaining: 0 };
+        }
     } catch (e) {
       primary = e;
       throw e;
@@ -223,6 +265,42 @@ export class MigrationRunner {
         );
       }
     }
+  }
+
+  private async repairFailedChecksums(files: ReturnType<typeof discover>): Promise<void> {
+    const filesByVersion = new Map(files.map((file) => [file.version, file]));
+    for (const row of (await this.repo.all()).filter((candidate) => !candidate.success && !candidate.baselined)) {
+      const file = filesByVersion.get(row.version);
+      if (!file) continue;
+      const repair = this.approvedRepairFor(row, file.path);
+      if (repair) {
+        await this.requireLockHeld();
+        if (!this.repo.repairFailedChecksum) {
+          throw new Error(`Adapter does not support audited failed-checksum repair for ${repair.version}`);
+        }
+        await this.repo.repairFailedChecksum(repair, this.appliedBy);
+      }
+    }
+  }
+
+  private approvedRepairFor(
+    row: Awaited<ReturnType<SchemaMigrationsRepo['all']>>[number],
+    path: string,
+  ): FailedMigrationChecksumRepair | undefined {
+    if (row.success || row.baselined) return undefined;
+    const actualChecksum = canonicalChecksumFile(path);
+    if (actualChecksum === row.checksum) return undefined;
+    const matches = this.checksumRepairs.filter((repair) =>
+      repair.version === row.version &&
+      repair.oldChecksum === row.checksum &&
+      repair.newChecksum === actualChecksum,
+    );
+    if (matches.length !== 1) return undefined;
+    const repair = matches[0]!;
+    if (repair.reason.trim().length === 0) {
+      throw new Error(`Checksum repair reason must not be blank for ${repair.version}`);
+    }
+    return repair;
   }
 
   /**
@@ -280,21 +358,41 @@ export class MigrationRunner {
   /**
    * Reconcile a success=0 row per spec step 7a.
    *
-   * Run the file's trailing CALL zn_assert_* postconditions FIRST:
+   * Run only the file's explicitly marked CALL zn_assert_* postconditions FIRST:
    *  - If they exist and all pass → the migration is already fully applied;
    *    markSuccess WITHOUT re-running the body (avoids double-apply hazard for
    *    non-idempotent bodies).
-   *  - If there are no asserts, OR any assert throws → re-run the ENTIRE
+   *  - If there is no marker, OR any marked assert throws → re-run the ENTIRE
    *    (idempotent) body, then markSuccess.
    *
-   * The asserts-first logic (and the requireLockHeld() guard before markSuccess)
-   * lives on the adapter (`reconcile`) — core only reads the file, derives the
-   * version, and delegates.
+   * New adapters perform the assertions/body only; the caller then performs the
+   * final lock check and markSuccess. A legacy adapter can still call markSuccess
+   * through the guarded repo supplied here, which enforces the same lock check.
    */
-  private async reconcile(path: string): Promise<void> {
+  private async reconcile(path: string): Promise<boolean> {
     const fileSql = readFileSync(path, 'utf8');
     const version = path.split('/').pop()!;
-    await this.adapter.reconcile(this.conn, version, fileSql, this.repo);
+    let markedByAdapter = false;
+    const guardedRepo: SchemaMigrationsRepo = {
+      ensureTable: () => this.repo.ensureTable(),
+      all: () => this.repo.all(),
+      claim: (rowVersion, checksum, appliedBy) => this.repo.claim(rowVersion, checksum, appliedBy),
+      markSuccess: async (rowVersion, executionMs) => {
+        await this.requireLockHeld();
+        await this.repo.markSuccess(rowVersion, executionMs);
+        markedByAdapter = true;
+      },
+      seedBaseline: (rowVersion, checksum, appliedBy) =>
+        this.repo.seedBaseline(rowVersion, checksum, appliedBy),
+      ...(this.repo.repairFailedChecksum
+        ? {
+            repairFailedChecksum: (repair: FailedMigrationChecksumRepair, repairedBy: string) =>
+              this.repo.repairFailedChecksum!(repair, repairedBy),
+          }
+        : {}),
+    };
+    await this.adapter.reconcile(this.conn, version, fileSql, guardedRepo);
+    return markedByAdapter;
   }
 
   /**

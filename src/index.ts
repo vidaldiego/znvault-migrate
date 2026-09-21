@@ -7,6 +7,7 @@ export { validateMigrationConfig } from './config.js';
 
 export { MigrationRunner } from './core/runner.js';
 export type { MigrationFile, MigrationRow, RunResult, MigrationPlan } from './core/types.js';
+export type { FailedMigrationChecksumRepair } from './core/failed-checksum-repair.js';
 
 export type { EngineAdapter, Conn, SchemaMigrationsRepo, EngineCredentials } from './adapters/engine-adapter.js';
 export { mysqlAdapter } from './adapters/mysql/mysql-adapter.js';

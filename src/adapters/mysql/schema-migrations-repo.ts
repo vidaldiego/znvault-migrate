@@ -1,6 +1,7 @@
 import type { MysqlConn } from './mysql-conn.js';
 import { CHECKSUM_ALGO } from '../../core/checksum.js';
 import type { MigrationRow } from '../../core/types.js';
+import type { FailedMigrationChecksumRepair } from '../../core/failed-checksum-repair.js';
 
 export type { MigrationRow };
 
@@ -33,7 +34,18 @@ export class SchemaMigrationsRepo {
           success       TINYINT(1)   NOT NULL DEFAULT 0,
           baselined     TINYINT(1)   NOT NULL DEFAULT 0,
           PRIMARY KEY (version)
-      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS schema_migration_repair_audit (
+          version       VARCHAR(255) NOT NULL,
+          old_checksum  CHAR(64)     NOT NULL,
+          new_checksum  CHAR(64)     NOT NULL,
+          reason        VARCHAR(512) NOT NULL,
+          repaired_at   DATETIME(3)  NOT NULL,
+          repaired_by   VARCHAR(128) NOT NULL,
+          PRIMARY KEY (version, old_checksum, new_checksum)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `);
   }
 
@@ -91,5 +103,38 @@ export class SchemaMigrationsRepo {
       'INSERT INTO schema_migrations (version, checksum, checksum_algo, applied_at, applied_by, execution_ms, success, baselined) VALUES (?, ?, ?, NOW(3), ?, 0, 1, 1)',
       [version, checksum, CHECKSUM_ALGO, appliedBy],
     );
+  }
+
+  async repairFailedChecksum(
+    repair: FailedMigrationChecksumRepair,
+    repairedBy: string,
+  ): Promise<void> {
+    await this.db.query('START TRANSACTION');
+    try {
+      const [okPacket] = await this.db.execute(
+        'UPDATE schema_migrations SET checksum = ? WHERE version = ? AND checksum = ? AND success = 0 AND baselined = 0',
+        [repair.newChecksum, repair.version, repair.oldChecksum],
+      );
+      const affected = (okPacket as { affectedRows?: number })?.affectedRows ?? 0;
+      if (affected !== 1) {
+        throw new Error(`Failed migration checksum repair no longer matches ${repair.version}; refusing to continue`);
+      }
+      await this.db.execute(
+        'INSERT INTO schema_migration_repair_audit (version, old_checksum, new_checksum, reason, repaired_at, repaired_by) VALUES (?, ?, ?, ?, NOW(3), ?)',
+        [repair.version, repair.oldChecksum, repair.newChecksum, repair.reason, repairedBy],
+      );
+      await this.db.query('COMMIT');
+    } catch (error) {
+      try {
+        await this.db.query('ROLLBACK');
+      } catch (rollbackError) {
+        console.warn(
+          `failed-checksum repair rollback failed; preserving the primary error: ${
+            rollbackError instanceof Error ? rollbackError.message : String(rollbackError)
+          }`,
+        );
+      }
+      throw error;
+    }
   }
 }

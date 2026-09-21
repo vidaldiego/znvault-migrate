@@ -7,21 +7,55 @@ import { readScaffoldingSql, dropDefinerObjects } from './scaffolding.js';
 import { SchemaMigrationsRepo } from './schema-migrations-repo.js';
 
 /**
- * True when a statement is a postcondition assertion call (zn_assert_* proc).
- * MySQL-convention detection, relocated verbatim from
- * znvault-plugin-payara/src/migrate/migration-runner.ts's private `isPostcondition`.
+ * True when a statement is a postcondition assertion call (zn_assert_* proc),
+ * allowing only non-executable comments before the CALL.
  */
+function withoutLeadingComments(statement: string): string {
+  let code = statement.trimStart();
+  for (;;) {
+    if (code.startsWith('--') || code.startsWith('#')) {
+      const newline = code.indexOf('\n');
+      if (newline < 0) return '';
+      code = code.slice(newline + 1).trimStart();
+      continue;
+    }
+    if (code.startsWith('/*') && !code.startsWith('/*!')) {
+      const end = code.indexOf('*/', 2);
+      if (end < 0) return '';
+      code = code.slice(end + 2).trimStart();
+      continue;
+    }
+    return code;
+  }
+}
+
 function isPostcondition(stmt: string): boolean {
-  return /^\s*CALL\s+zn_assert_/i.test(stmt);
+  return /^CALL\s+zn_assert_/i.test(withoutLeadingComments(stmt));
+}
+
+function markedPostconditions(sql: string, version: string): string[] {
+  const marker = /^\s*--\s*@reconcile-postconditions\s*$/gim;
+  const matches = [...sql.matchAll(marker)];
+  if (matches.length === 0) return [];
+  if (matches.length > 1) {
+    throw new Error(`Migration ${version} contains multiple reconcile-postconditions markers`);
+  }
+  const match = matches[0]!;
+  const statements = splitStatements(sql.slice(match.index! + match[0].length));
+  if (statements.length === 0) {
+    throw new Error(`Migration ${version} has an empty reconcile-postconditions block`);
+  }
+  if (!statements.every((statement) => isPostcondition(statement))) {
+    throw new Error(`Migration ${version} contains a non-assertion after @reconcile-postconditions`);
+  }
+  return statements;
 }
 
 /**
  * The concrete MySQL EngineAdapter. Wires the already-ported leaf modules
  * (lock, sql-splitter, scaffolding, schema-migrations-repo) and this file's
  * connection.ts into the engine-agnostic `EngineAdapter` interface consumed by
- * `core/runner.ts`. No new logic beyond delegation — the split-execute apply
- * logic and the asserts-first reconcile logic are relocated verbatim from the
- * source `migration-runner.ts` (`executeStatements` / `reconcile`).
+ * `core/runner.ts`.
  */
 export const mysqlAdapter: EngineAdapter = {
   engine: 'mysql',
@@ -58,34 +92,23 @@ export const mysqlAdapter: EngineAdapter = {
   },
 
   /**
-   * Relocated verbatim from migration-runner.ts's private `reconcile(path)`:
-   * asserts-first — run the file's trailing `CALL zn_assert_*` postconditions
-   * first; if they all pass, the migration is already applied (markSuccess
-   * without re-running the idempotent body). If there are no asserts, or any
-   * assert throws, re-run the entire body, then markSuccess.
+   * Asserts-first reconciliation is available only for the statements after an
+   * explicit `-- @reconcile-postconditions` marker. Every statement in that
+   * block must be a `CALL zn_assert_*`; legacy files without the marker re-run
+   * their complete idempotent body. This prevents an early precondition from
+   * being mistaken for durable proof that the body completed.
    *
-   * FIDELITY NOTE (documented per task brief): the source's `reconcile(path)`
-   * called `this.requireLockHeld()` a SECOND time here, immediately before
-   * `repo.markSuccess(version, 0)` (a guard against a session kill happening
-   * during the (possibly long) body re-execution). That per-reconcile guard is
-   * intentionally OMITTED here — the interface's `reconcile` signature has no
-   * lock hook, and lock-liveness semantics are owned by the core runner, not
-   * this adapter. The core runner (`core/runner.ts`, reconcile loop) already
-   * calls `await this.requireLockHeld()` immediately BEFORE invoking
-   * `adapter.reconcile(...)` for each file, so the PRE-reconcile guard is
-   * preserved. What's dropped is only the narrower POST-body-re-execution,
-   * pre-markSuccess check. This is a minimal, deliberate fidelity relocation,
-   * not an oversight — flagged here per the task brief's instruction to
-   * document rather than silently decide.
+   * The adapter intentionally does not mark schema_migrations successful. The
+   * core runner owns that state change so it can re-check the session lock after
+   * the assertions/body and immediately before markSuccess.
    */
   async reconcile(
     conn: Conn,
     version: string,
     fileSql: string,
-    repo: ISchemaMigrationsRepo,
   ): Promise<void> {
     const stmts = splitStatements(fileSql);
-    const asserts = stmts.filter((s) => isPostcondition(s));
+    const asserts = markedPostconditions(fileSql, version);
 
     let satisfied = false;
     if (asserts.length > 0) {
@@ -107,8 +130,10 @@ export const mysqlAdapter: EngineAdapter = {
         await conn.query(s);
       }
     }
+  },
 
-    await repo.markSuccess(version, 0);
+  async rollbackTransaction(conn: Conn): Promise<void> {
+    await conn.query('ROLLBACK');
   },
 
   schemaMigrationsRepo(conn: Conn): ISchemaMigrationsRepo {

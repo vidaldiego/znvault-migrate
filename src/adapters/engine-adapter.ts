@@ -1,4 +1,5 @@
 import type { MigrationRow } from '../core/types.js';
+import type { FailedMigrationChecksumRepair } from '../core/failed-checksum-repair.js';
 
 /** A live DB connection handle. */
 export interface Conn {
@@ -22,6 +23,7 @@ export interface SchemaMigrationsRepo {
   claim(version: string, checksum: string, appliedBy: string): Promise<void>;
   markSuccess(version: string, executionMs: number): Promise<void>;
   seedBaseline(version: string, checksum: string, appliedBy: string): Promise<void>;
+  repairFailedChecksum?(repair: FailedMigrationChecksumRepair, repairedBy: string): Promise<void>;
 }
 
 export interface EngineCredentials {
@@ -64,15 +66,20 @@ export interface EngineAdapter {
   applyMigrationFile(conn: Conn, sql: string): Promise<void>;
 
   /**
-   * Reconcile a file whose tracking row is success=0 (claimed-but-not-confirmed — a crash between
-   * claim and confirm). Takes the file's `version` (derived by the core runner from the path) and
-   * the `SchemaMigrationsRepo` so the adapter can `markSuccess(version, 0)` when the postconditions
-   * pass — this matches the existing `reconcile(path)` at `migration-runner.ts:321-348` which derives
-   * the version and calls `repo.markSuccess(version, 0)`. mysql: re-run only the trailing
-   * `CALL zn_assert_*` postconditions; if they pass, the migration already applied → `markSuccess`
-   * without re-executing.
+   * Reconcile a file whose tracking row is success=0. The adapter verifies the
+   * postconditions or re-runs the body. New adapters should leave markSuccess to
+   * the core. For compatibility, a legacy adapter may call repo.markSuccess;
+   * the runner supplies a guarded repo that checks lock ownership immediately
+   * before accepting that durable state change.
    */
   reconcile(conn: Conn, version: string, fileSql: string, repo: SchemaMigrationsRepo): Promise<void>;
+
+  /**
+   * Best-effort rollback used before cleanup DDL after any phase failure. Optional
+   * for source compatibility with custom adapters; when absent, cleanup is skipped
+   * because rollback cannot be confirmed.
+   */
+  rollbackTransaction?(conn: Conn): Promise<void>;
 
   schemaMigrationsRepo(conn: Conn): SchemaMigrationsRepo;
 
