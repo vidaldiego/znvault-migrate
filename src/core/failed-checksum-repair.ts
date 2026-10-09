@@ -16,4 +16,10 @@ export const APPROVED_FAILED_MIGRATION_CHECKSUM_REPAIRS: readonly FailedMigratio
     newChecksum: 'f5a0359ee534635f52504d12a8eeac378d32b163d4820b8082d772d07b4a4165',
     reason: 'Replace the failed migration that referenced the nonexistent _printable_style.draft_definition column',
   },
+  {
+    version: '2026-10-09_002_partner_sandbox_public_origin.sql',
+    oldChecksum: '9d063c4a327c73e352fdf340ff4c33c47225f13404a3745fa0fd66e354587926',
+    newChecksum: '33dc3d7fb7d076200c874e187bd121eb3adafd4c799e2fdcfc5e11059d2a2337',
+    reason: 'Recover the failed sandbox origin cutover with stable guarded DDL and assertion-first online reconciliation',
+  },
 ];

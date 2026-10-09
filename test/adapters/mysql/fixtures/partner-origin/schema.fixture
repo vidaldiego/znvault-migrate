@@ -1,0 +1,27 @@
+-- Remote tenant IDs are descriptors, never production Empresa references.
+CREATE TABLE IF NOT EXISTS _mwm_part_b_integration (
+    binding_id VARCHAR(36) NOT NULL,
+    group_id VARCHAR(36) NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    partner_id INT NOT NULL,
+    account_id INT NOT NULL,
+    runtime_id VARCHAR(100) NOT NULL,
+    target_tenant_id INT NOT NULL,
+    desired_revision INT NOT NULL,
+    applied_revision INT NOT NULL DEFAULT 0,
+    source_id INT NULL,
+    configuration_json LONGTEXT NOT NULL,
+    api_base_url VARCHAR(512) NOT NULL,
+    configured_by VARCHAR(255) NOT NULL,
+    applied_receipt_json LONGTEXT NULL,
+    created_by VARCHAR(255) NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    row_version INT NOT NULL DEFAULT 0,
+    PRIMARY KEY(binding_id),
+    KEY ix_mwm_b_integration_owner(partner_id,account_id),
+    CONSTRAINT ck_mwm_b_remote_tenant CHECK(target_tenant_id=99007),
+    CONSTRAINT ck_mwm_b_revision CHECK(desired_revision>0 AND applied_revision>=0 AND applied_revision<=desired_revision)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+INSERT INTO _mwm_part_b_integration VALUES ('1','g1','Integration',3,4,'partner-sandbox',99007,2,2,10,'{}','https://partners-sandbox.zincapp.com/api','operator','{}','creator','2026-10-01','2026-10-01',5);
